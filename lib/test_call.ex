@@ -9,10 +9,15 @@ defmodule TestCall do
 
   alias AeternityNode.Model.{
     ContractCreateTx,
+    GenericSignedTx,
+    ContractCallObject,
+    TxInfoObject,
     Error,
     Tx,
     PostTxResponse
   }
+
+  alias Tesla.Env
 
   @default_deposit 0
   @default_amount 0
@@ -21,6 +26,8 @@ defmodule TestCall do
   @init_function "init"
   @fate_ct_version 0x50003
   @aevm_ct_version 0x60001
+  @await_attempts 75
+  @await_attempt_interval 200
 
   def deploy do
     client = client()
@@ -41,6 +48,11 @@ defmodule TestCall do
   def search_contract(hash) do
     client = client()
     AeppSDK.Contract.get(client, hash)
+  end
+
+  def get_tx_info_by_hash(hash) do
+    client = client()
+    TransactionApi.get_transaction_info_by_hash(client.connection, hash)
   end
 
   def client do
@@ -300,13 +312,75 @@ defmodule TestCall do
              tx: encoded_signed_tx
            }) do
       IO.inspect(tx_hash, label: "TX_HASH: ")
-      TransactionApi.get_transaction_info_by_hash(connection, tx_hash)
+      await_mining(connection, tx_hash, ContractCreateTx)
     else
       {:ok, %Error{reason: message}} ->
         {:error, message}
 
       {:error, _} = error ->
         error
+    end
+  end
+
+  def await_mining(connection, tx_hash, type) do
+    await_mining(connection, tx_hash, @await_attempts, type)
+  end
+
+  @doc false
+  def await_mining(_connection, _tx_hash, 0, _type),
+    do:
+      {:error,
+       "Transaction wasn't mined after #{@await_attempts * @await_attempt_interval / 1_000} seconds"}
+
+  @doc false
+  def await_mining(connection, tx_hash, attempts, type) do
+    Process.sleep(@await_attempt_interval)
+
+    mining_status =
+      case type do
+        ContractCallTx ->
+          TransactionApi.get_transaction_info_by_hash(connection, tx_hash)
+
+        ContractCreateTx ->
+          TransactionApi.get_transaction_info_by_hash(connection, tx_hash)
+
+        _ ->
+          TransactionApi.get_transaction_by_hash(connection, tx_hash)
+      end
+
+    case mining_status do
+      {:ok, %GenericSignedTx{block_hash: "none", block_height: -1}} ->
+        await_mining(connection, tx_hash, attempts - 1, type)
+
+      {:ok, %GenericSignedTx{block_hash: block_hash, block_height: block_height, hash: tx_hash}} ->
+        {:ok, %{block_hash: block_hash, block_height: block_height, tx_hash: tx_hash}}
+
+      {:ok,
+       %TxInfoObject{
+         call_info: %ContractCallObject{
+           log: log,
+           return_value: return_value,
+           return_type: return_type
+         }
+       }} ->
+        {:ok, %GenericSignedTx{block_hash: block_hash, block_height: block_height, hash: tx_hash}} =
+          TransactionApi.get_transaction_by_hash(connection, tx_hash)
+
+        {:ok,
+         %{
+           block_hash: block_hash,
+           block_height: block_height,
+           tx_hash: tx_hash,
+           return_value: return_value,
+           return_type: return_type,
+           log: log
+         }}
+
+      {:ok, %Error{}} ->
+        await_mining(connection, tx_hash, attempts - 1, type)
+
+      {:error, %Env{} = env} ->
+        {:error, env}
     end
   end
 end
